@@ -1,0 +1,273 @@
+# Sports Live Wire
+
+Polls sports RSS feeds every 10 minutes and posts new headlines to your
+Slack or Discord channel. No paid API keys required.
+
+## Setup (5-10 minutes)
+
+1. **Get a webhook URL**
+   - **Slack:** create an Incoming Webhook for the channel you want
+     (Slack > Settings > Manage apps > search "Incoming Webhooks" > Add to
+     channel). You'll get a URL like `https://hooks.slack.com/services/...`
+   - **Discord:** in the channel, go to Channel Settings > Integrations >
+     Webhooks > New Webhook > Copy Webhook URL. You'll get a URL like
+     `https://discord.com/api/webhooks/...`
+
+2. **Put this code in a GitHub repo**
+   - Create a new repo (can be private) and push these files to it.
+
+3. **Add the webhook URL as a secret**
+   - In the repo: Settings > Secrets and variables > Actions > New repository secret
+   - Name: `WEBHOOK_URL`
+   - Value: the URL from step 1
+
+4. **Turn it on**
+   - That's it. The workflow in `.github/workflows/sports-alerts.yml` runs
+     automatically every 10 minutes, even if your computer is off.
+   - The first run won't post anything — it just records the current
+     headlines as "already seen" so you don't get flooded on day one.
+   - You can also trigger a run manually from the repo's Actions tab
+     ("Run workflow") to test it right away.
+
+## Customizing
+
+Open `sports_alert.py`:
+
+- **FEEDS** — add/remove RSS sources or leagues
+- **KEYWORDS** — set this to a list like `["trade", "fired", "injury", "suspend"]`
+  if you only want alerts on certain kinds of news instead of every headline
+- **MAX_SEEN_ITEMS** — how much history to remember (default is plenty)
+
+## Running it without GitHub (optional)
+
+You can also just run `python sports_alert.py` locally on a cron job or
+via a Claude Code scheduled task — just make sure `WEBHOOK_URL` is set as
+an environment variable wherever it runs, and that `seen.json` persists
+between runs (don't delete it).
+
+feedparser==6.0.11
+requests==2.32.3
+
+#!/usr/bin/env python3
+"""
+Sports Live Wire
+-----------------
+Polls a set of sports RSS feeds, figures out what's new since the last run,
+and posts those new items to a Slack or Discord channel via webhook.
+
+Designed to be run on a schedule (e.g. every 10-15 min via GitHub Actions,
+cron, or a Claude Code scheduled task). Each run is stateless except for
+seen.json, which tracks story links we've already posted so you don't get
+duplicates.
+
+Setup:
+    1. pip install -r requirements.txt
+    2. Set the WEBHOOK_URL environment variable to your Slack or Discord
+       incoming webhook URL.
+    3. Run: python sports_alert.py
+
+Customize:
+    - Edit FEEDS below to add/remove sources or leagues.
+    - Edit KEYWORDS (optional) to only alert on stories matching certain
+      words (e.g. "trade", "injury", "fired"). Leave as None to get
+      everything from the feeds.
+"""
+
+import os
+import json
+import sys
+import hashlib
+from pathlib import Path
+
+import feedparser
+import requests
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+FEEDS = {
+    "ESPN Top Headlines": "https://www.espn.com/espn/rss/news",
+    "ESPN NFL": "https://www.espn.com/espn/rss/nfl/news",
+    "ESPN NBA": "https://www.espn.com/espn/rss/nba/news",
+    "ESPN MLB": "https://www.espn.com/espn/rss/mlb/news",
+    "ESPN NHL": "https://www.espn.com/espn/rss/nhl/news",
+    "ESPN College Football": "https://www.espn.com/espn/rss/ncf/news",
+    "ESPN College Basketball": "https://www.espn.com/espn/rss/ncb/news",
+    "CBS Sports": "https://www.cbssports.com/rss/headlines/",
+}
+
+# Set to a list of lowercase substrings to only get alerted on matching
+# headlines, e.g. ["trade", "fired", "injury", "suspend", "sign"]
+# Leave as None to get every new headline from every feed above.
+KEYWORDS = None
+
+SEEN_FILE = Path(__file__).parent / "seen.json"
+MAX_SEEN_ITEMS = 2000  # cap so the file doesn't grow forever
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+
+# ---------------------------------------------------------------------------
+# State (dedup) handling
+# ---------------------------------------------------------------------------
+
+
+def load_seen() -> set:
+    if SEEN_FILE.exists():
+        try:
+            return set(json.loads(SEEN_FILE.read_text()))
+        except (json.JSONDecodeError, OSError):
+            return set()
+    return set()
+
+
+def save_seen(seen: set) -> None:
+    # Keep only the most recent N to bound file growth. Order isn't
+    # meaningful in a set, so this is a simple cap, not a true LRU.
+    trimmed = list(seen)[-MAX_SEEN_ITEMS:]
+    SEEN_FILE.write_text(json.dumps(trimmed))
+
+
+def item_id(entry, source: str) -> str:
+    """Stable id for a feed entry so we can tell if we've posted it before."""
+    base = entry.get("link") or entry.get("id") or entry.get("title", "")
+    return hashlib.sha256(f"{source}:{base}".encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Fetching
+# ---------------------------------------------------------------------------
+
+
+def fetch_new_items(seen: set) -> list:
+    new_items = []
+    for source, url in FEEDS.items():
+        try:
+            parsed = feedparser.parse(url)
+        except Exception as e:
+            print(f"[warn] failed to fetch {source}: {e}", file=sys.stderr)
+            continue
+
+        for entry in parsed.entries:
+            uid = item_id(entry, source)
+            if uid in seen:
+                continue
+
+            title = entry.get("title", "(no title)")
+            link = entry.get("link", "")
+            summary = entry.get("summary", "")
+
+            if KEYWORDS and not any(k.lower() in title.lower() for k in KEYWORDS):
+                seen.add(uid)  # mark seen so it doesn't get re-checked forever
+                continue
+
+            new_items.append(
+                {
+                    "uid": uid,
+                    "source": source,
+                    "title": title,
+                    "link": link,
+                    "summary": summary,
+                }
+            )
+            seen.add(uid)
+
+    return new_items
+
+
+# ---------------------------------------------------------------------------
+# Delivery
+# ---------------------------------------------------------------------------
+
+
+def is_discord_webhook(url: str) -> bool:
+    return "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url
+
+
+def post_to_webhook(item: dict) -> None:
+    text = f"🚨 *{item['source']}*\n{item['title']}\n{item['link']}"
+
+    if is_discord_webhook(WEBHOOK_URL):
+        payload = {"content": text}
+    else:  # assume Slack incoming webhook format
+        payload = {"text": text}
+
+    resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+    if resp.status_code >= 300:
+        print(
+            f"[warn] webhook post failed ({resp.status_code}): {resp.text}",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    if not WEBHOOK_URL:
+        print("ERROR: set the WEBHOOK_URL environment variable.", file=sys.stderr)
+        sys.exit(1)
+
+    seen = load_seen()
+    is_first_run = len(seen) == 0
+
+    new_items = fetch_new_items(seen)
+
+    if is_first_run:
+        # On the very first run there's no real "new" -- everything in the
+        # feeds looks new. Just record it as seen instead of blasting the
+        # channel with every story currently in every feed.
+        print(f"First run: recorded {len(new_items)} existing items as seen, no alerts sent.")
+    else:
+        for item in new_items:
+            print(f"New: [{item['source']}] {item['title']}")
+            post_to_webhook(item)
+        print(f"Done. Posted {len(new_items)} new item(s).")
+
+    save_seen(seen)
+
+
+if __name__ == "__main__":
+    main()
+
+name: Sports Live Wire
+
+on:
+  schedule:
+    # Runs every 10 minutes. GitHub may delay this slightly under load,
+    # but it does not need your computer on at all.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write  # needed so the workflow can commit the updated seen.json
+
+jobs:
+  check-sports-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run live wire check
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: python sports_alert.py
+
+      - name: Save updated seen.json
+        run: |
+          git config user.name "sports-live-wire-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || git commit -m "Update seen items"
+          git push
